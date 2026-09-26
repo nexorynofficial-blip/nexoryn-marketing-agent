@@ -76,9 +76,9 @@ class ClaudeClient:
         response = self._client.messages.create(
             model=self._model,
             max_tokens=60,
-            temperature=0,
             system=[self._knowledge.system_block(), {"type": "text", "text": instructions}],
             messages=[{"role": "user", "content": "Classify the message above."}],
+            extra_body={"temperature": 0},
         )
 
         return _parse_classification_json(_extract_text(response))
@@ -141,9 +141,9 @@ class ClaudeClient:
         response = self._client.messages.create(
             model=self._model,
             max_tokens=300,
-            temperature=0.4,
             system=[self._knowledge.system_block(), {"type": "text", "text": instructions}],
             messages=[{"role": "user", "content": "Draft the reply."}],
+            extra_body={"temperature": 0.4},
         )
 
         reply = _extract_text(response).strip()
@@ -169,9 +169,9 @@ class ClaudeClient:
         response = self._client.messages.create(
             model=self._model,
             max_tokens=300,
-            temperature=0,
             system=[{"type": "text", "text": instructions}],
             messages=[{"role": "user", "content": "Translate."}],
+            extra_body={"temperature": 0},
         )
 
         return _extract_text(response).strip()

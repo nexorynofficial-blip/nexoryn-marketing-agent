@@ -151,6 +151,45 @@ class TestTranslateToEnglish:
         assert result == "Thank you very much"
 
 
+class TestTemperaturePassedViaExtraBody:
+    """anthropic>=1.0 removed `temperature` as a direct messages.create()
+    kwarg (extra_body is now required) -- these guard against ever passing
+    it directly again, which raises a TypeError against the real SDK even
+    though a plain MagicMock would silently accept it."""
+
+    def test_classify_message_uses_extra_body(self):
+        client = make_client_with_mocked_response('{"category": "question", "language": "en"}')
+
+        client.classify_message("Do you build websites?")
+
+        call_kwargs = client._client.messages.create.call_args.kwargs
+        assert "temperature" not in call_kwargs
+        assert call_kwargs["extra_body"] == {"temperature": 0}
+
+    def test_draft_reply_uses_extra_body(self):
+        client = make_client_with_mocked_response("Some reply")
+
+        client.draft_reply(
+            message_text="Do you build websites?",
+            classification=Classification.QUESTION,
+            language=Language.ENGLISH,
+            is_handoff=False,
+        )
+
+        call_kwargs = client._client.messages.create.call_args.kwargs
+        assert "temperature" not in call_kwargs
+        assert call_kwargs["extra_body"] == {"temperature": 0.4}
+
+    def test_translate_to_english_uses_extra_body(self):
+        client = make_client_with_mocked_response("Thank you")
+
+        client.translate_to_english("Shukriya")
+
+        call_kwargs = client._client.messages.create.call_args.kwargs
+        assert "temperature" not in call_kwargs
+        assert call_kwargs["extra_body"] == {"temperature": 0}
+
+
 class TestParseClassificationJsonDirectly:
     def test_missing_keys_falls_back_gracefully(self):
         result = _parse_classification_json('{"category": "spam"}')
