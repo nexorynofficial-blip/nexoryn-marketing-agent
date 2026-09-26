@@ -1,10 +1,16 @@
-"""SQLite connection and schema management.
+"""SQLite connection, schema management, and small row<->dataclass helpers.
 
-Single-tenant, local-first app: one file, no external database service.
+Single-tenant, local-first app: one file, no external database service. The
+helpers below exist so slack_app.py (and later pipeline.py/dedupe.py) share
+one place that knows how to read/write rows, instead of scattering raw SQL
+across the app.
 """
 from __future__ import annotations
 
 import sqlite3
+from typing import Optional
+
+from app.models import Classification, Draft, Language, Message, MessageStatus, MessageType, Platform
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -35,7 +41,11 @@ CREATE TABLE IF NOT EXISTS drafts (
     created_at TEXT NOT NULL,
     approved_by TEXT,
     approved_at TEXT,
-    sent_at TEXT
+    sent_at TEXT,
+    -- The human's replacement text from the Edit modal, kept separate from
+    -- draft_text so both the AI's original and what was actually approved
+    -- stay recoverable from the DB alone.
+    edited_text TEXT
 );
 
 CREATE TABLE IF NOT EXISTS processed_webhook_ids (
@@ -55,10 +65,153 @@ def get_connection(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+# Additive-only migrations applied after CREATE TABLE IF NOT EXISTS, for
+# columns added after a dev DB already exists on disk. (table, column, DDL type)
+_MIGRATIONS = [
+    ("drafts", "edited_text", "TEXT"),
+]
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    for table, column, ddl_type in _MIGRATIONS:
+        existing_columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing_columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}")
+    conn.commit()
+
+
 def init_db(db_path: str) -> None:
     conn = get_connection(db_path)
     try:
         conn.executescript(SCHEMA)
         conn.commit()
+        _apply_migrations(conn)
     finally:
         conn.close()
+
+
+# ---- row <-> dataclass mapping ----
+
+
+def _row_to_message(row: sqlite3.Row) -> Message:
+    return Message(
+        id=row["id"],
+        platform=Platform(row["platform"]),
+        type=MessageType(row["type"]),
+        sender_id=row["sender_id"],
+        sender_username=row["sender_username"],
+        text=row["text"],
+        received_at=row["received_at"],
+        detected_language=Language(row["detected_language"]) if row["detected_language"] else None,
+        english_translation=row["english_translation"],
+        classification=Classification(row["classification"]) if row["classification"] else None,
+        status=MessageStatus(row["status"]),
+    )
+
+
+def _row_to_draft(row: sqlite3.Row) -> Draft:
+    return Draft(
+        message_id=row["message_id"],
+        draft_text=row["draft_text"],
+        created_at=row["created_at"],
+        id=row["id"],
+        draft_language=row["draft_language"],
+        is_handoff=bool(row["is_handoff"]),
+        slack_message_ts=row["slack_message_ts"],
+        approved_by=row["approved_by"],
+        approved_at=row["approved_at"],
+        sent_at=row["sent_at"],
+        edited_text=row["edited_text"],
+    )
+
+
+# ---- messages ----
+
+
+def insert_message(conn: sqlite3.Connection, message: Message) -> None:
+    conn.execute(
+        """INSERT INTO messages
+               (id, platform, type, sender_id, sender_username, text,
+                detected_language, english_translation, received_at,
+                classification, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            message.id,
+            message.platform.value,
+            message.type.value,
+            message.sender_id,
+            message.sender_username,
+            message.text,
+            message.detected_language.value if message.detected_language else None,
+            message.english_translation,
+            message.received_at,
+            message.classification.value if message.classification else None,
+            message.status.value,
+        ),
+    )
+    conn.commit()
+
+
+def get_message(conn: sqlite3.Connection, message_id: str) -> Optional[Message]:
+    row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+    return _row_to_message(row) if row else None
+
+
+def update_message_status(conn: sqlite3.Connection, message_id: str, status: MessageStatus) -> None:
+    conn.execute("UPDATE messages SET status = ? WHERE id = ?", (status.value, message_id))
+    conn.commit()
+
+
+# ---- drafts ----
+
+
+def insert_draft(conn: sqlite3.Connection, draft: Draft) -> int:
+    cursor = conn.execute(
+        """INSERT INTO drafts
+               (message_id, draft_text, draft_language, is_handoff,
+                slack_message_ts, created_at, approved_by, approved_at,
+                sent_at, edited_text)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            draft.message_id,
+            draft.draft_text,
+            draft.draft_language,
+            int(draft.is_handoff),
+            draft.slack_message_ts,
+            draft.created_at,
+            draft.approved_by,
+            draft.approved_at,
+            draft.sent_at,
+            draft.edited_text,
+        ),
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def get_draft(conn: sqlite3.Connection, draft_id: int) -> Optional[Draft]:
+    row = conn.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone()
+    return _row_to_draft(row) if row else None
+
+
+def update_draft_slack_ts(conn: sqlite3.Connection, draft_id: int, ts: str) -> None:
+    conn.execute("UPDATE drafts SET slack_message_ts = ? WHERE id = ?", (ts, draft_id))
+    conn.commit()
+
+
+def update_draft_approval(conn: sqlite3.Connection, draft_id: int, approved_by: str, approved_at: str) -> None:
+    conn.execute(
+        "UPDATE drafts SET approved_by = ?, approved_at = ? WHERE id = ?",
+        (approved_by, approved_at, draft_id),
+    )
+    conn.commit()
+
+
+def update_draft_sent(conn: sqlite3.Connection, draft_id: int, sent_at: str) -> None:
+    conn.execute("UPDATE drafts SET sent_at = ? WHERE id = ?", (sent_at, draft_id))
+    conn.commit()
+
+
+def update_draft_edited_text(conn: sqlite3.Connection, draft_id: int, edited_text: str) -> None:
+    conn.execute("UPDATE drafts SET edited_text = ? WHERE id = ?", (edited_text, draft_id))
+    conn.commit()
