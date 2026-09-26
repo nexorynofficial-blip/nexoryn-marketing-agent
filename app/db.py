@@ -12,7 +12,11 @@ from typing import Optional
 
 from app.models import Classification, Draft, Language, Message, MessageStatus, MessageType, Platform
 
-SCHEMA = """
+# Built from the enum (not hand-copied) so the DB CHECK constraint and
+# MessageStatus can never drift apart.
+_STATUS_VALUES_SQL = ", ".join(f"'{status.value}'" for status in MessageStatus)
+
+SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
     platform TEXT NOT NULL CHECK (platform IN ('instagram', 'facebook')),
@@ -24,11 +28,7 @@ CREATE TABLE IF NOT EXISTS messages (
     english_translation TEXT,
     received_at TEXT NOT NULL,
     classification TEXT CHECK (classification IN ('lead', 'question', 'compliment', 'complaint', 'spam', 'other')),
-    status TEXT NOT NULL DEFAULT 'pending_draft' CHECK (status IN (
-        'pending_draft', 'pending_approval', 'approved', 'sent',
-        'rejected', 'expired', 'already_handled', 'spam_pending',
-        'spam_hidden', 'spam_kept'
-    ))
+    status TEXT NOT NULL DEFAULT 'pending_draft' CHECK (status IN ({_STATUS_VALUES_SQL}))
 );
 
 CREATE TABLE IF NOT EXISTS drafts (
@@ -80,12 +80,52 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _messages_table_matches_current_status_check(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'"
+    ).fetchone()
+    return row is not None and f"'{MessageStatus.ALERTED.value}'" in row["sql"]
+
+
+def _migrate_messages_status_check(conn: sqlite3.Connection) -> None:
+    """SQLite can't ALTER a CHECK constraint in place, so when a dev DB
+    predates a new MessageStatus value, recreate the table (same columns,
+    updated CHECK) and copy every row across.
+
+    legacy_alter_table avoids SQLite silently rewriting drafts.message_id's
+    REFERENCES clause to point at messages_old when we rename messages out
+    of the way -- without it, the later DROP TABLE messages_old fails (or
+    worse, leaves drafts pointing at a table that no longer exists).
+    """
+    if _messages_table_matches_current_status_check(conn):
+        return
+
+    messages_create_sql = SCHEMA.split("CREATE TABLE IF NOT EXISTS drafts")[0]
+
+    conn.execute("PRAGMA foreign_keys = OFF")
+    conn.execute("PRAGMA legacy_alter_table = ON")
+    try:
+        conn.executescript(
+            f"""
+            ALTER TABLE messages RENAME TO messages_old;
+            {messages_create_sql}
+            INSERT INTO messages SELECT * FROM messages_old;
+            DROP TABLE messages_old;
+            """
+        )
+        conn.commit()
+    finally:
+        conn.execute("PRAGMA legacy_alter_table = OFF")
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
 def init_db(db_path: str) -> None:
     conn = get_connection(db_path)
     try:
         conn.executescript(SCHEMA)
         conn.commit()
         _apply_migrations(conn)
+        _migrate_messages_status_check(conn)
     finally:
         conn.close()
 

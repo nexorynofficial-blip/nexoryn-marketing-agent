@@ -112,6 +112,26 @@ def post_spam_check(app: App, *, channel_id: str, db_path: str, message: Message
         conn.close()
 
 
+def post_alert_only(
+    app: App,
+    *,
+    channel_id: str,
+    message: Message,
+    message_translation: Optional[str] = None,
+) -> str:
+    """Posts a plain notification with no buttons at all -- used for comments
+    that need the team (pricing/meetings/off-doc questions), which per
+    agency_knowledge.md get NO public reply, only an internal alert. There's
+    nothing to approve/reject here, so no draft row and no DB write."""
+    blocks = _build_alert_only_blocks(message, message_translation)
+    result = app.client.chat_postMessage(
+        channel=channel_id,
+        blocks=blocks,
+        text=f"Needs a personal reply: {message.text[:100]}",
+    )
+    return result["ts"]
+
+
 # ---- block builders (pure, easy to unit test) ----
 
 
@@ -254,6 +274,52 @@ def _build_spam_blocks(message: Message) -> List[dict]:
                     "action_id": "keep_comment",
                     "value": value,
                 },
+            ],
+        }
+    )
+    return blocks
+
+
+def _build_alert_only_blocks(message: Message, message_translation: Optional[str] = None) -> List[dict]:
+    blocks: List[dict] = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"🔔 Needs a personal reply — {_label(message)}", "emoji": True},
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*From:*\n@{message.sender_username or message.sender_id}"},
+                {
+                    "type": "mrkdwn",
+                    "text": f"*Classification:*\n{message.classification.value if message.classification else 'unknown'}",
+                },
+            ],
+        },
+        {
+            "type": "section",
+            "block_id": "message_text_block",
+            "text": {"type": "mrkdwn", "text": f"*Message:*\n{message.text}"},
+        },
+    ]
+
+    if message_translation:
+        blocks.append(
+            {
+                "type": "context",
+                "block_id": "message_translation_block",
+                "elements": [{"type": "mrkdwn", "text": f"*English:* {message_translation}"}],
+            }
+        )
+
+    blocks.append(
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": "No public reply was drafted — this needs a personal reply from the team directly on Instagram/Facebook.",
+                }
             ],
         }
     )

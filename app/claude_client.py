@@ -35,6 +35,11 @@ _HANDOFF_SENTINEL = "HANDOFF_NEEDED"
 class ClassificationResult:
     category: Classification
     language: Language
+    # Whether the message asks about price/cost/rates/packages, in any
+    # language. A hardcoded English keyword list would miss Urdu-script and
+    # Roman-Urdu pricing questions, so this rides along on the classification
+    # call itself rather than a local heuristic in pipeline.py.
+    mentions_pricing: bool = False
 
 
 @dataclass(frozen=True)
@@ -66,16 +71,19 @@ class ClaudeClient:
             "below and respond with STRICT JSON ONLY (no markdown, no commentary), "
             "in exactly this shape:\n"
             '{"category": "<one of: lead, question, compliment, complaint, spam, other>", '
-            '"language": "<one of: en, ur_script, ur_roman, other>"}\n\n'
+            '"language": "<one of: en, ur_script, ur_roman, other>", '
+            '"mentions_pricing": <true or false>}\n\n'
             "category: what kind of message this is.\n"
             "language: en for English, ur_script for Urdu written in Urdu script, "
-            "ur_roman for Urdu written in Latin/Roman letters, other for anything else.\n\n"
+            "ur_roman for Urdu written in Latin/Roman letters, other for anything else.\n"
+            "mentions_pricing: true if the message asks about price, cost, rates, "
+            "packages, or budget, in ANY language or script -- false otherwise.\n\n"
             f"Message:\n{message_text}"
         )
 
         response = self._client.messages.create(
             model=self._model,
-            max_tokens=60,
+            max_tokens=80,
             system=[self._knowledge.system_block(), {"type": "text", "text": instructions}],
             messages=[{"role": "user", "content": "Classify the message above."}],
             extra_body={"temperature": 0},
@@ -198,10 +206,11 @@ def _parse_classification_json(raw: str) -> ClassificationResult:
         data = json.loads(cleaned)
         category = Classification(data["category"])
         language = Language(data["language"])
-        return ClassificationResult(category=category, language=language)
+        mentions_pricing = bool(data.get("mentions_pricing", False))
+        return ClassificationResult(category=category, language=language, mentions_pricing=mentions_pricing)
     except (json.JSONDecodeError, KeyError, ValueError) as exc:
         logger.warning(
             "classification_parse_failed",
             extra={"raw_response": raw[:200], "error": str(exc)},
         )
-        return ClassificationResult(category=Classification.OTHER, language=Language.OTHER)
+        return ClassificationResult(category=Classification.OTHER, language=Language.OTHER, mentions_pricing=False)

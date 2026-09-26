@@ -34,6 +34,12 @@ _LABEL_NAMES = {
     Language.URDU_ROMAN: "Roman Urdu",
 }
 
+# Anchored on the "(fixed policy)" marker rather than the exact question
+# wording, so rephrasing the FAQ question doesn't silently break parsing.
+# Only an English version exists in the doc today -- pipeline.py combines
+# this with the language-appropriate handoff message for pricing questions.
+_PRICING_LINE_RE = re.compile(r"^\|[^|]+\|([^|]*\(fixed policy\)[^|]*)\|\s*$", re.MULTILINE)
+
 
 class KnowledgeFormatError(ValueError):
     """Raised when agency_knowledge.md doesn't match the expected handoff
@@ -63,10 +69,22 @@ def _extract_handoff_messages(text: str) -> Dict[Language, str]:
     return messages
 
 
+def _extract_pricing_line(text: str) -> str:
+    match = _PRICING_LINE_RE.search(text)
+    if not match:
+        raise KnowledgeFormatError(
+            "Could not find the fixed pricing-policy line in the FAQ table of "
+            "agency_knowledge.md (expected a table row whose answer cell contains "
+            "'(fixed policy)')."
+        )
+    return match.group(1).replace("(fixed policy)", "").strip()
+
+
 @dataclass(frozen=True)
 class Knowledge:
     raw_text: str
     handoff_messages: Dict[Language, str]
+    pricing_line: str
 
     def system_block(self) -> dict:
         """Anthropic system content block with prompt caching enabled.
@@ -86,4 +104,5 @@ class Knowledge:
 def load_knowledge(path: Union[str, Path] = DEFAULT_KNOWLEDGE_PATH) -> Knowledge:
     text = Path(path).read_text(encoding="utf-8")
     handoff_messages = _extract_handoff_messages(text)
-    return Knowledge(raw_text=text, handoff_messages=handoff_messages)
+    pricing_line = _extract_pricing_line(text)
+    return Knowledge(raw_text=text, handoff_messages=handoff_messages, pricing_line=pricing_line)

@@ -43,6 +43,10 @@ class MessageStatus(str, Enum):
     SPAM_PENDING = "spam_pending"
     SPAM_HIDDEN = "spam_hidden"
     SPAM_KEPT = "spam_kept"
+    # Comment escalated to the team per agency_knowledge.md's "Comments"
+    # section: no public reply is drafted at all, only a Slack alert --
+    # unlike PENDING_APPROVAL there is no draft to approve/reject here.
+    ALERTED = "alerted"
 
 
 @dataclass

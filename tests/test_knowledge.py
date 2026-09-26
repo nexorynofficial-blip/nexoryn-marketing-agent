@@ -5,12 +5,20 @@ from app.knowledge import (
     Knowledge,
     KnowledgeFormatError,
     _extract_handoff_messages,
+    _extract_pricing_line,
     load_knowledge,
 )
 from app.models import Language
 
 SAMPLE_DOC = """
 # Some Agency
+
+## FAQs
+
+| Question | Approved answer |
+| --- | --- |
+| What services do you offer? | We do things. |
+| How much do you charge? | Pricing depends on your needs, so let's talk on a call. (fixed policy) |
 
 ## Fixed messages
 
@@ -61,7 +69,7 @@ def test_missing_one_language_raises_clear_error():
 
 def test_load_knowledge_real_file_parses_without_error():
     """Smoke test against the actual agency_knowledge.md the user maintains --
-    confirms their real document still matches the expected handoff format."""
+    confirms their real document still matches the expected handoff/pricing format."""
     if not DEFAULT_KNOWLEDGE_PATH.exists():
         pytest.skip("knowledge/agency_knowledge.md not found")
 
@@ -71,10 +79,23 @@ def test_load_knowledge_real_file_parses_without_error():
     assert len(knowledge.raw_text) > 0
     for language in (Language.ENGLISH, Language.URDU_SCRIPT, Language.URDU_ROMAN):
         assert knowledge.handoff_messages[language].strip() != ""
+    assert knowledge.pricing_line.strip() != ""
+
+
+def test_extract_pricing_line_from_sample_doc():
+    pricing_line = _extract_pricing_line(SAMPLE_DOC)
+
+    assert pricing_line == "Pricing depends on your needs, so let's talk on a call."
+    assert "(fixed policy)" not in pricing_line
+
+
+def test_missing_pricing_line_raises_clear_error():
+    with pytest.raises(KnowledgeFormatError, match="pricing"):
+        _extract_pricing_line("# Doc with no FAQ table at all")
 
 
 def test_system_block_has_cache_control():
-    knowledge = Knowledge(raw_text="hello", handoff_messages={})
+    knowledge = Knowledge(raw_text="hello", handoff_messages={}, pricing_line="")
     block = knowledge.system_block()
 
     assert block["type"] == "text"

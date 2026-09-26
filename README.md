@@ -8,10 +8,12 @@ accounts — only Nexoryn's own.
 
 ## Current status
 
-Built in phases; see the build plan for details. **Phase A (scaffold +
-config)** is complete: folder structure, SQLite schema, env var loading, and
-`scripts/verify_setup.py` all work. Nothing that talks to Claude, Slack
-buttons, or Meta webhooks exists yet — that comes in later phases.
+Built in phases. **Phases A–D are complete**: config/DB scaffold, the Meta
+and Claude clients, the Slack approvals app (post/Approve/Edit/Reject,
+Hide/Keep for spam), and the webhook receiver + full pipeline wiring them
+together. What's still missing (Phase E): backfilling the last 24h on
+startup, echo detection (cancel a draft if a human already replied via
+Meta Business Suite), and draft expiry/nudge background jobs.
 
 ## Prerequisites
 
@@ -71,24 +73,70 @@ buttons, or Meta webhooks exists yet — that comes in later phases.
 
 ```
 .
-├── knowledge/agency_knowledge.md   # agency facts, tone rules, handoff messages (edit this yourself)
+├── knowledge/agency_knowledge.md   # agency facts, tone rules, handoff messages, fixed pricing line (edit this yourself)
 ├── app/
 │   ├── config.py        # env var loading/validation
-│   ├── db.py             # SQLite schema + connections
-│   ├── models.py          # data classes for messages/drafts/webhook dedupe
-│   ├── meta_client.py      # Graph API calls (Phase B)
-│   ├── claude_client.py     # Claude classify/draft/translate calls (Phase B)
-│   ├── knowledge.py          # loads + cache-prepares the knowledge file (Phase B)
-│   ├── slack_app.py            # Slack Bolt app: approvals UI (Phase C)
-│   ├── webhooks.py               # Meta webhook receiver (Phase D)
-│   ├── pipeline.py                 # core event -> draft -> Slack flow (Phase D)
-│   ├── dedupe.py                     # echo detection + draft expiry jobs (Phase E)
-│   └── main.py                        # FastAPI app entrypoint
+│   ├── db.py             # SQLite schema, migrations, connections, row<->dataclass helpers
+│   ├── models.py          # data classes + enums for messages/drafts/webhook dedupe
+│   ├── meta_client.py      # Graph API calls + webhook signature verification
+│   ├── claude_client.py     # Claude classify/draft/translate calls
+│   ├── knowledge.py          # loads + cache-prepares the knowledge file, extracts fixed strings
+│   ├── slack_app.py            # Slack Bolt app: post draft/spam-check/alert-only, button + modal handlers
+│   ├── webhooks.py               # Meta webhook receiver: verify challenge, signature check, payload parsing, dedup
+│   ├── pipeline.py                 # core event -> classify -> draft/handoff/spam routing -> Slack
+│   ├── dedupe.py                     # webhook-event dedup (echo detection + expiry jobs: Phase E)
+│   └── main.py                        # FastAPI app entrypoint; starts Slack Socket Mode alongside it
 ├── scripts/
-│   ├── verify_setup.py    # run this first
-│   └── backfill.py         # pulls last 24h of unanswered messages (Phase E)
+│   ├── verify_setup.py         # run this first
+│   ├── try_pipeline_sample.py    # classify+draft a few sample messages via the real API, no Slack/webhooks
+│   ├── try_slack_draft.py          # posts fake drafts and runs Slack Socket Mode so you can click buttons live
+│   └── backfill.py                   # pulls last 24h of unanswered messages (Phase E)
 └── tests/
 ```
+
+## Running the full app locally
+
+```bash
+uvicorn app.main:app --reload --port 8000
+```
+
+This starts the FastAPI webhook server on port 8000 **and** connects the
+Slack app in Socket Mode in the background, so both webhook delivery and
+Slack button clicks work from one process. Visit `http://localhost:8000/health`
+to confirm it's up.
+
+## Testing webhooks locally with cloudflared
+
+Meta needs to reach your webhook endpoint over the public internet, so for
+local development you need a temporary public URL pointed at your machine.
+(Slack doesn't need this — Socket Mode is outbound-only.)
+
+1. Install `cloudflared` (no account needed for a quick tunnel):
+   - **Windows**: download the `cloudflared-windows-amd64.exe` from
+     [Cloudflare's releases page](https://github.com/cloudflare/cloudflared/releases/latest),
+     or `winget install --id Cloudflare.cloudflared`.
+   - **macOS**: `brew install cloudflared`.
+2. With `uvicorn app.main:app --port 8000` running in one terminal, run in another:
+   ```bash
+   cloudflared tunnel --url http://localhost:8000
+   ```
+3. Copy the generated `https://<random-words>.trycloudflare.com` URL from the
+   terminal output.
+4. In your Meta App dashboard → Webhooks, set the Callback URL to
+   `https://<random-words>.trycloudflare.com/webhook` and the Verify Token to
+   the same value as your `.env`'s `META_WEBHOOK_VERIFY_TOKEN`, then click
+   Verify and Save. Meta will hit the GET `/webhook` endpoint with a
+   challenge; a successful verify confirms the token matches on both ends.
+5. Subscribe to the fields you need (Page/Instagram webhook product):
+   `comments` (and `feed` if you also want Facebook Page comments) for new
+   comments, and `messages` for new DMs.
+6. Leave the tunnel and `uvicorn` running, then send a real test comment or
+   DM to your Page/IG account and watch it show up in the Slack approvals
+   channel.
+
+Note: the cloudflared URL changes every time you restart the tunnel, so
+you'll need to re-paste it into the Meta dashboard each time you restart it
+during development.
 
 ## Data
 

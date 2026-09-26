@@ -14,6 +14,7 @@ def make_knowledge() -> Knowledge:
             Language.URDU_SCRIPT: "شکریہ! – ٹیم",
             Language.URDU_ROMAN: "Shukriya! – The Nexoryn Team",
         },
+        pricing_line="Pricing depends on your needs, so let's talk on a call.",
     )
 
 
@@ -41,6 +42,25 @@ class TestClassifyMessage:
 
         assert result.category == Classification.LEAD
         assert result.language == Language.URDU_ROMAN
+
+    def test_mentions_pricing_parsed_true(self):
+        client = make_client_with_mocked_response(
+            '{"category": "lead", "language": "ur_roman", "mentions_pricing": true}'
+        )
+
+        result = client.classify_message("Kitna kharcha hoga website ka?")
+
+        assert result.mentions_pricing is True
+
+    def test_mentions_pricing_defaults_false_when_absent(self):
+        """Backward-compatible parsing: a response shaped without the field
+        (e.g. an older cached response, or a slightly malformed one) must not
+        crash and must not silently imply a pricing question."""
+        client = make_client_with_mocked_response('{"category": "question", "language": "en"}')
+
+        result = client.classify_message("Do you build websites?")
+
+        assert result.mentions_pricing is False
 
     def test_malformed_json_falls_back_to_other_without_raising(self):
         client = make_client_with_mocked_response("not json at all")
