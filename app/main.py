@@ -1,5 +1,13 @@
-"""FastAPI app instance: mounts the webhooks router and starts the Slack
-Bolt app (Socket Mode, in a background thread) alongside it.
+"""FastAPI app instance: mounts the webhooks router and connects the Slack
+Bolt app (Socket Mode) alongside it, in the same process and thread.
+
+Uses SocketModeHandler.connect() rather than .start(): .start() blocks the
+calling thread AND registers a SIGINT handler, which only works on the
+main thread of the main interpreter -- fine for a script that does nothing
+else, but it crashed here because uvicorn owns the main thread's signal
+handling. .connect() does the same handshake and then returns, since the
+socket read loop runs in its own background threads internally; it's safe
+to call directly from FastAPI's startup hook.
 
 APScheduler jobs (echo detection, draft expiry/nudge) are added here in
 Phase E.
@@ -7,7 +15,6 @@ Phase E.
 from __future__ import annotations
 
 import logging
-import threading
 
 from fastapi import FastAPI
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -64,6 +71,8 @@ pipeline_ctx = PipelineContext(
 app = FastAPI(title="Nexoryn Social Agent")
 app.include_router(build_webhook_router(config, pipeline_ctx))
 
+socket_mode_handler = SocketModeHandler(slack_app, config.slack_app_token)
+
 
 @app.get("/health")
 def health() -> dict:
@@ -71,8 +80,12 @@ def health() -> dict:
 
 
 @app.on_event("startup")
-def _start_slack_socket_mode() -> None:
-    handler = SocketModeHandler(slack_app, config.slack_app_token)
-    thread = threading.Thread(target=handler.start, daemon=True)
-    thread.start()
-    logger.info("slack_socket_mode_started")
+def _connect_slack_socket_mode() -> None:
+    socket_mode_handler.connect()
+    logger.info("slack_socket_mode_connected")
+
+
+@app.on_event("shutdown")
+def _close_slack_socket_mode() -> None:
+    socket_mode_handler.close()
+    logger.info("slack_socket_mode_closed")
