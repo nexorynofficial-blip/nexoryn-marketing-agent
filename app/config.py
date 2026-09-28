@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -53,6 +54,9 @@ class Config:
     db_path: str = "nexoryn_agent.db"
     log_level: str = "INFO"
     port: int = 8000
+    # Set only in production (e.g. /var/log/nexoryn-agent/agent.log on the
+    # VM); left unset for local dev, which just logs to stdout.
+    log_file_path: Optional[str] = None
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -79,6 +83,7 @@ class Config:
             db_path=os.environ.get("DB_PATH") or "nexoryn_agent.db",
             log_level=os.environ.get("LOG_LEVEL") or "INFO",
             port=int(os.environ.get("PORT") or "8000"),
+            log_file_path=os.environ.get("LOG_FILE_PATH") or None,
         )
 
     def graph_api_base(self) -> str:

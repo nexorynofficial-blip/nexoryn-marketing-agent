@@ -1,0 +1,40 @@
+[Unit]
+Description=Nexoryn Social Agent (FastAPI + Slack Socket Mode)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nexoryn
+Group=nexoryn
+WorkingDirectory=/opt/nexoryn-agent
+
+# Belt-and-suspenders with app/config.py's own load_dotenv() call: this
+# makes the vars available to the process even if dotenv's directory
+# search ever behaves unexpectedly under systemd. The leading "-" means
+# systemd won't fail to start if the file is briefly missing.
+EnvironmentFile=-/opt/nexoryn-agent/.env
+
+# Bind to loopback only -- Caddy is the public-facing TLS terminator on
+# this same host, so uvicorn should never be reachable directly.
+ExecStart=/opt/nexoryn-agent/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+
+Restart=on-failure
+RestartSec=5
+
+# journald is the primary log sink (captures stdout/stderr automatically);
+# app/logging_config.py additionally writes to /var/log/nexoryn-agent/agent.log
+# when LOG_FILE_PATH is set in .env.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nexoryn-agent
+
+# Modest hardening -- the service only needs to read its own code/venv and
+# write to its own DB/log paths.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/nexoryn-agent /var/log/nexoryn-agent
+
+[Install]
+WantedBy=multi-user.target

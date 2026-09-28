@@ -8,13 +8,11 @@ accounts — only Nexoryn's own.
 
 ## Current status
 
-Built in phases. **Phases A–E are complete** and feature-complete for local
-testing: config/DB scaffold, the Meta and Claude clients, the Slack
-approvals app (post/Approve/Edit/Reject, Hide/Keep for spam), the webhook
-receiver + full pipeline, startup backfill, echo detection, and draft
-expiry/nudge. 131/131 tests pass, all against mocked Meta/Slack/Anthropic
-responses. What's left before a real deployment: Phase F (Oracle Cloud VM,
-systemd/scheduled startup) — a separate follow-up session.
+Built in phases. **Phases A–F are complete**: config/DB scaffold, the Meta
+and Claude clients, the Slack approvals app, the webhook receiver + full
+pipeline, startup backfill, echo detection, draft expiry/nudge, structured
+JSON logging, and Oracle Cloud VM deployment tooling (systemd + Caddy).
+136/136 tests pass, all against mocked Meta/Slack/Anthropic responses.
 
 ## Prerequisites
 
@@ -86,12 +84,17 @@ systemd/scheduled startup) — a separate follow-up session.
 │   ├── webhooks.py               # Meta webhook receiver: verify challenge, signature check, payload parsing, dedup, echo dispatch
 │   ├── pipeline.py                 # core event -> classify -> draft/handoff/spam routing -> Slack
 │   ├── dedupe.py                     # webhook-event dedup, echo detection, draft expiry/nudge
-│   └── main.py                        # FastAPI entrypoint; startup backfill, Slack Socket Mode, APScheduler jobs
+│   ├── logging_config.py               # structured JSON logging (stdout + optional file sink)
+│   └── main.py                          # FastAPI entrypoint; startup backfill, Slack Socket Mode, APScheduler jobs
 ├── scripts/
 │   ├── verify_setup.py         # run this first
 │   ├── try_pipeline_sample.py    # classify+draft a few sample messages via the real API, no Slack/webhooks
 │   ├── try_slack_draft.py          # posts fake drafts and runs Slack Socket Mode so you can click buttons live
-│   └── backfill.py                   # pulls unanswered comments/DMs from the last N hours; also runnable standalone
+│   ├── backfill.py                   # pulls unanswered comments/DMs from the last N hours; also runnable standalone
+│   ├── setup_vm.sh                     # runs ON the VM: installs deps, systemd + Caddy + logrotate config
+│   └── deploy_to_vm.sh                   # runs on YOUR laptop: copies code/.env to the VM, runs setup, starts the service
+├── systemd/nexoryn-agent.service   # systemd unit -> /etc/systemd/system/ on the VM
+├── caddy/Caddyfile                 # Caddy reverse-proxy + auto-HTTPS config -> /etc/caddy/ on the VM
 └── tests/
 ```
 
@@ -162,6 +165,87 @@ Note: the cloudflared URL changes every time you restart the tunnel, so
 you'll need to re-paste it into the Meta dashboard each time you restart it
 during development.
 
+## Deploying to Oracle Cloud (production)
+
+This runs the agent 24/7 on a real domain instead of a local machine +
+cloudflared tunnel. **None of this has been executed or verified against a
+real VM** — the scripts below were written carefully against standard
+practice (Caddy's own defaults, systemd conventions, Ubuntu 24.04's
+package set) but this development session had no VM/SSH/DNS access to
+actually run them. Treat the first deploy as a real test, not a
+rubber-stamped step.
+
+### What you need before starting
+
+- An Oracle Cloud "Always Free" VM (Ubuntu 24.04 LTS) already running, reachable via SSH.
+- `agent.nexoryn.tech`'s DNS A record pointed at the VM's public IP (Caddy
+  can't get a Let's Encrypt certificate until this resolves correctly).
+- Your SSH private key for that VM.
+- A filled-in `.env` (same 10+ variables as local dev, see `.env.example`) —
+  set `DB_PATH=/opt/nexoryn-agent/nexoryn_agent.db` and
+  `LOG_FILE_PATH=/var/log/nexoryn-agent/agent.log` in it for this environment.
+- Oracle Cloud's security list / network security group must allow inbound
+  TCP 80 and 443 (needed for Let's Encrypt's HTTP challenge and for HTTPS
+  traffic) — this is an Oracle Cloud console setting, not something
+  `setup_vm.sh` can configure from inside the VM.
+
+### Deploy
+
+From your laptop, in this project's root:
+
+```bash
+bash scripts/deploy_to_vm.sh <vm_ip_or_hostname> /path/to/ssh/key /path/to/.env
+```
+
+This will:
+1. Check SSH connectivity.
+2. Copy the project to `/opt/nexoryn-agent` on the VM (via rsync if
+   available, otherwise a tarball over scp) — excluding `.venv`, `.git`,
+   `__pycache__`, and your local `nexoryn_agent.db`.
+3. **Ask you to confirm** before uploading `.env` (it contains real secrets).
+4. Run `scripts/setup_vm.sh` on the VM via `sudo` — installs Python,
+   Caddy, creates the `nexoryn` system user, sets up the venv, installs
+   the systemd unit and Caddy config, sets up logrotate.
+5. Start the service and print `systemctl status`.
+
+Pass `--with-db` as a 4th argument if you want to upload your local
+`nexoryn_agent.db` too (asks for separate confirmation) — otherwise the VM
+starts with a fresh, empty database and `init_db()` creates the schema on
+first run.
+
+### Verifying it worked
+
+```bash
+ssh -i /path/to/ssh/key ubuntu@agent.nexoryn.tech "systemctl status nexoryn-agent --no-pager"
+curl https://agent.nexoryn.tech/health          # expect {"status":"ok"} with a valid cert
+ssh -i /path/to/ssh/key ubuntu@agent.nexoryn.tech "sudo journalctl -u nexoryn-agent -n 50 --no-pager"
+```
+
+Then re-point Meta's webhook Callback URL from your cloudflared URL to
+`https://agent.nexoryn.tech/webhook` (same Verify Token as before), send a
+real test comment or DM, and confirm it reaches Slack the same way it did
+locally.
+
+### Day-to-day monitoring
+
+```bash
+ssh -i /path/to/ssh/key ubuntu@agent.nexoryn.tech "systemctl status nexoryn-agent"
+ssh -i /path/to/ssh/key ubuntu@agent.nexoryn.tech "journalctl -u nexoryn-agent -f"    # live tail
+curl https://agent.nexoryn.tech/health
+```
+
+Logs are structured JSON (see `app/logging_config.py`) written to both
+stdout (captured by journald automatically) and `/var/log/nexoryn-agent/agent.log`
+(rotated daily by logrotate, 14 days kept, compressed). `/health` only
+confirms FastAPI itself is up — it doesn't check Slack/Meta connectivity,
+by design, so it stays useful as a liveness probe even if an external
+service is degraded.
+
+If the process crashes, systemd restarts it automatically
+(`Restart=on-failure`). Re-running `deploy_to_vm.sh` (or just
+`setup_vm.sh` on the VM) is safe — every step checks whether it's already
+done first.
+
 ## Data
 
 All state lives in a single local SQLite file, `nexoryn_agent.db` (gitignored,
@@ -172,4 +256,10 @@ a single-tenant, local-first app.
 
 Tokens are never logged or printed in full — only the first/last 4
 characters, via `app.config.mask_secret`. Never paste real secrets into a
-chat with an AI assistant; they only ever go into your local `.env`.
+chat with an AI assistant; they only ever go into your local `.env`, or
+get uploaded to the VM via `deploy_to_vm.sh`'s explicit confirmation
+prompt. Logging is structured JSON (`app/logging_config.py`, built on
+`structlog`) — every entry carries a timestamp, level, logger name, and
+whatever context a call site passed via `extra={...}` (e.g. `message_id`,
+`draft_id`); nothing beyond that is ever added automatically, so a log
+call is only as safe as what you choose to pass it.

@@ -1,0 +1,7 @@
+# Force LF line endings for files that get copied straight to a Linux VM
+# or parsed by Linux services -- a Windows checkout with core.autocrlf=true
+# would otherwise silently rewrite these to CRLF, which breaks bash's
+# shebang line and corrupts systemd/Caddy config parsing.
+*.sh text eol=lf
+systemd/*.service text eol=lf
+caddy/Caddyfile text eol=lf

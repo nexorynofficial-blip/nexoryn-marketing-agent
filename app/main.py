@@ -29,15 +29,16 @@ from app.config import load_config
 from app.db import init_db
 from app.dedupe import run_comment_echo_poll, run_expiry_nudge_check
 from app.knowledge import load_knowledge
+from app.logging_config import configure_logging
 from app.meta_client import MetaClient
 from app.pipeline import PipelineContext
 from app.slack_app import SendCallbacks, build_slack_app
 from app.webhooks import build_webhook_router
 
-logging.basicConfig(level=logging.INFO)
+config = load_config()
+configure_logging(level=config.log_level, log_file_path=config.log_file_path)
 logger = logging.getLogger(__name__)
 
-config = load_config()
 init_db(config.db_path)
 
 knowledge = load_knowledge()
