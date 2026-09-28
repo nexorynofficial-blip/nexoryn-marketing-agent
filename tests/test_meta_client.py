@@ -68,6 +68,69 @@ def test_send_dm_posts_json_payload():
     assert result == {"message_id": "MSG1"}
 
 
+def test_get_conversations_lists_page_conversations():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v21.0/PAGE123/conversations"
+        assert request.url.params["limit"] == "50"
+        return httpx.Response(200, json={"data": [{"id": "conv1", "updated_time": "2026-01-01T00:00:00+0000"}]})
+
+    client = make_client(handler)
+    result = client.get_conversations()
+
+    assert result["data"][0]["id"] == "conv1"
+
+
+def test_get_comment_replies_lists_replies():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v21.0/COMMENT1/comments"
+        return httpx.Response(200, json={"data": [{"id": "reply1", "from": {"id": "PAGE123"}}]})
+
+    client = make_client(handler)
+    result = client.get_comment_replies("COMMENT1")
+
+    assert result["data"][0]["from"]["id"] == "PAGE123"
+
+
+def test_get_recent_posts():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v21.0/PAGE123/posts"
+        return httpx.Response(200, json={"data": [{"id": "post1"}]})
+
+    client = make_client(handler)
+    result = client.get_recent_posts()
+
+    assert result["data"][0]["id"] == "post1"
+
+
+def test_get_recent_media():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v21.0/IG456/media"
+        return httpx.Response(200, json={"data": [{"id": "media1"}]})
+
+    client = make_client(handler)
+    result = client.get_recent_media()
+
+    assert result["data"][0]["id"] == "media1"
+
+
+def test_get_comments_for_post():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v21.0/post1/comments"
+        return httpx.Response(200, json={"data": []})
+
+    client = make_client(handler)
+    client.get_comments_for_post("post1")
+
+
+def test_get_comments_for_media():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v21.0/media1/comments"
+        return httpx.Response(200, json={"data": []})
+
+    client = make_client(handler)
+    client.get_comments_for_media("media1")
+
+
 def test_graph_api_error_raises_meta_api_error():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

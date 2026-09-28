@@ -45,7 +45,12 @@ CREATE TABLE IF NOT EXISTS drafts (
     -- The human's replacement text from the Edit modal, kept separate from
     -- draft_text so both the AI's original and what was actually approved
     -- stay recoverable from the DB alone.
-    edited_text TEXT
+    edited_text TEXT,
+    -- DM drafts only (Meta's 24h reply window): received_at + 24h, used by
+    -- the expiry/nudge job. NULL for comments, which have no such window.
+    draft_expires_at TEXT,
+    -- Set once a nudge has been posted, so we nudge each draft at most once.
+    nudged_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS processed_webhook_ids (
@@ -69,6 +74,8 @@ def get_connection(db_path: str) -> sqlite3.Connection:
 # columns added after a dev DB already exists on disk. (table, column, DDL type)
 _MIGRATIONS = [
     ("drafts", "edited_text", "TEXT"),
+    ("drafts", "draft_expires_at", "TEXT"),
+    ("drafts", "nudged_at", "TEXT"),
 ]
 
 
@@ -162,6 +169,8 @@ def _row_to_draft(row: sqlite3.Row) -> Draft:
         approved_at=row["approved_at"],
         sent_at=row["sent_at"],
         edited_text=row["edited_text"],
+        draft_expires_at=row["draft_expires_at"],
+        nudged_at=row["nudged_at"],
     )
 
 
@@ -210,8 +219,8 @@ def insert_draft(conn: sqlite3.Connection, draft: Draft) -> int:
         """INSERT INTO drafts
                (message_id, draft_text, draft_language, is_handoff,
                 slack_message_ts, created_at, approved_by, approved_at,
-                sent_at, edited_text)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                sent_at, edited_text, draft_expires_at, nudged_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             draft.message_id,
             draft.draft_text,
@@ -223,6 +232,8 @@ def insert_draft(conn: sqlite3.Connection, draft: Draft) -> int:
             draft.approved_at,
             draft.sent_at,
             draft.edited_text,
+            draft.draft_expires_at,
+            draft.nudged_at,
         ),
     )
     conn.commit()
@@ -255,3 +266,80 @@ def update_draft_sent(conn: sqlite3.Connection, draft_id: int, sent_at: str) -> 
 def update_draft_edited_text(conn: sqlite3.Connection, draft_id: int, edited_text: str) -> None:
     conn.execute("UPDATE drafts SET edited_text = ? WHERE id = ?", (edited_text, draft_id))
     conn.commit()
+
+
+def update_draft_nudged(conn: sqlite3.Connection, draft_id: int, nudged_at: str) -> None:
+    conn.execute("UPDATE drafts SET nudged_at = ? WHERE id = ?", (nudged_at, draft_id))
+    conn.commit()
+
+
+# ---- echo detection / nudge lookups ----
+
+
+def get_pending_dm_message_by_sender(conn: sqlite3.Connection, sender_id: str) -> Optional[Message]:
+    """Most recent still-pending DM from this sender -- used by DM echo
+    detection when an is_echo webhook event tells us the Page just messaged
+    this customer (whether that was our own approved send or a teammate
+    replying via Business Suite)."""
+    row = conn.execute(
+        """SELECT * FROM messages
+           WHERE sender_id = ? AND type = 'dm' AND status = ?
+           ORDER BY received_at DESC LIMIT 1""",
+        (sender_id, MessageStatus.PENDING_APPROVAL.value),
+    ).fetchone()
+    return _row_to_message(row) if row else None
+
+
+def get_draft_for_message(conn: sqlite3.Connection, message_id: str) -> Optional[Draft]:
+    row = conn.execute(
+        "SELECT * FROM drafts WHERE message_id = ? ORDER BY id DESC LIMIT 1", (message_id,)
+    ).fetchone()
+    return _row_to_draft(row) if row else None
+
+
+def list_pending_comment_message_ids(conn: sqlite3.Connection) -> list:
+    """All comment message ids still awaiting approval -- the fallback poll
+    checks each of these for a reply from our own account."""
+    rows = conn.execute(
+        "SELECT id FROM messages WHERE type = 'comment' AND status = ?",
+        (MessageStatus.PENDING_APPROVAL.value,),
+    ).fetchall()
+    return [row["id"] for row in rows]
+
+
+def list_expiring_unnudged_dm_drafts(conn: sqlite3.Connection, cutoff_iso: str) -> list:
+    """(Message, Draft) pairs for pending DM drafts expiring at or before
+    `cutoff_iso` that haven't been nudged yet."""
+    rows = conn.execute(
+        """SELECT m.*, d.id AS draft_id, d.draft_text, d.draft_language, d.is_handoff,
+                  d.slack_message_ts, d.created_at AS draft_created_at, d.approved_by,
+                  d.approved_at, d.sent_at, d.edited_text, d.draft_expires_at, d.nudged_at
+           FROM drafts d
+           JOIN messages m ON m.id = d.message_id
+           WHERE m.status = ? AND m.type = 'dm'
+             AND d.draft_expires_at IS NOT NULL
+             AND d.draft_expires_at <= ?
+             AND d.nudged_at IS NULL""",
+        (MessageStatus.PENDING_APPROVAL.value, cutoff_iso),
+    ).fetchall()
+
+    results = []
+    for row in rows:
+        message = _row_to_message(row)
+        draft = Draft(
+            id=row["draft_id"],
+            message_id=row["id"],
+            draft_text=row["draft_text"],
+            created_at=row["draft_created_at"],
+            draft_language=row["draft_language"],
+            is_handoff=bool(row["is_handoff"]),
+            slack_message_ts=row["slack_message_ts"],
+            approved_by=row["approved_by"],
+            approved_at=row["approved_at"],
+            sent_at=row["sent_at"],
+            edited_text=row["edited_text"],
+            draft_expires_at=row["draft_expires_at"],
+            nudged_at=row["nudged_at"],
+        )
+        results.append((message, draft))
+    return results

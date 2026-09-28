@@ -1,11 +1,15 @@
 """FastAPI router: Meta webhook verify challenge, POST event receiver,
-signature validation, per-item dedup, and dispatch into pipeline.py.
+signature validation, per-item dedup, and dispatch into pipeline.py/dedupe.py.
 
 Parses two payload shapes per Meta's Webhooks Reference:
   - "changes" entries with field "comments" (Instagram) or "feed" (Facebook
-    Page) -- new comments.
+    Page) -- new comments. A new comment authored by our own account is
+    either a normal reply (dispatched to echo detection if it has a
+    `parent` id) or otherwise ignored.
   - "messaging" entries (shared shape for Messenger and Instagram Direct)
-    -- new DMs.
+    -- new DMs. A message with `is_echo: true` means the Page just sent a
+    message (us or a teammate via Business Suite) and is dispatched to
+    echo detection instead of being treated as an incoming customer message.
 
 NOTE: the exact payload shapes here are built from Meta's documented
 webhook formats but have not yet been exercised against real deliveries.
@@ -24,14 +28,22 @@ from fastapi import APIRouter, Request, Response
 
 from app.config import Config
 from app.db import get_connection
-from app.dedupe import is_duplicate_webhook_event, mark_webhook_event_processed
+from app.dedupe import handle_comment_echo, handle_dm_echo, is_duplicate_webhook_event, mark_webhook_event_processed
 from app.meta_client import verify_webhook_signature
 from app.models import Platform
-from app.pipeline import CommentEvent, MessageEvent, PipelineContext, process_comment_event, process_message_event
+from app.pipeline import (
+    CommentEchoEvent,
+    CommentEvent,
+    DmEchoEvent,
+    MessageEvent,
+    PipelineContext,
+    process_comment_event,
+    process_message_event,
+)
 
 logger = logging.getLogger(__name__)
 
-Event = Union[CommentEvent, MessageEvent]
+Event = Union[CommentEvent, MessageEvent, DmEchoEvent, CommentEchoEvent]
 
 
 def build_webhook_router(config: Config, ctx: PipelineContext) -> APIRouter:
@@ -76,8 +88,12 @@ def build_webhook_router(config: Config, ctx: PipelineContext) -> APIRouter:
                 try:
                     if isinstance(event, CommentEvent):
                         process_comment_event(ctx, event)
-                    else:
+                    elif isinstance(event, MessageEvent):
                         process_message_event(ctx, event)
+                    elif isinstance(event, DmEchoEvent):
+                        handle_dm_echo(ctx, event.recipient_id)
+                    else:
+                        handle_comment_echo(ctx, event.parent_comment_id)
                 except Exception:  # noqa: BLE001 - one bad event must never break the ack or other events
                     logger.exception("event_processing_failed", extra={"dedup_key": event.dedup_key})
         finally:
@@ -106,7 +122,9 @@ def _iter_events(payload: Dict[str, Any], own_ids: Set[str]) -> Iterator[Event]:
                 yield event
 
 
-def _parse_change(change: Dict[str, Any], platform: Platform, own_ids: Set[str]) -> Optional[CommentEvent]:
+def _parse_change(
+    change: Dict[str, Any], platform: Platform, own_ids: Set[str]
+) -> Union[CommentEvent, CommentEchoEvent, None]:
     field = change.get("field")
     value = change.get("value", {})
 
@@ -116,12 +134,14 @@ def _parse_change(change: Dict[str, Any], platform: Platform, own_ids: Set[str])
         sender = value.get("from", {})
         sender_id = sender.get("id")
         sender_username = sender.get("username")
+        parent_id = value.get("parent", {}).get("id")
     elif field == "feed" and value.get("item") == "comment" and value.get("verb", "add") == "add":
         comment_id = value.get("comment_id")
         text = value.get("message", "")
         sender = value.get("from", {})
         sender_id = sender.get("id")
         sender_username = sender.get("name")
+        parent_id = value.get("parent_id")
     else:
         return None
 
@@ -130,8 +150,11 @@ def _parse_change(change: Dict[str, Any], platform: Platform, own_ids: Set[str])
         return None
 
     if sender_id in own_ids:
-        # Our own reply (sent by this bot, or by a human via Business Suite)
-        # -- never draft a reply to ourselves.
+        # Our own reply (sent by this bot, or by a human via Business Suite).
+        # Never draft a reply to ourselves -- but if it's a reply to a
+        # comment we're tracking, use it as an echo-detection signal.
+        if parent_id:
+            return CommentEchoEvent(dedup_key=f"comment_echo:{comment_id}", parent_comment_id=parent_id)
         return None
 
     return CommentEvent(
@@ -144,16 +167,22 @@ def _parse_change(change: Dict[str, Any], platform: Platform, own_ids: Set[str])
     )
 
 
-def _parse_messaging_event(event: Dict[str, Any], platform: Platform, own_ids: Set[str]) -> Optional[MessageEvent]:
+def _parse_messaging_event(
+    event: Dict[str, Any], platform: Platform, own_ids: Set[str]
+) -> Union[MessageEvent, DmEchoEvent, None]:
     message = event.get("message")
     if not message:
         # Read receipts, postbacks, etc. -- not a text message to process.
         return None
 
     if message.get("is_echo"):
-        # Our own sent message (or a human teammate's, via Business Suite)
-        # being echoed back. Phase E uses these to cancel pending drafts;
-        # for now, just don't treat it as a new incoming message.
+        # The Page just sent a message (us, or a human teammate via
+        # Business Suite) -- use it as an echo-detection signal rather
+        # than treating it as a new incoming customer message.
+        recipient_id = event.get("recipient", {}).get("id")
+        if recipient_id:
+            mid = message.get("mid", recipient_id)
+            return DmEchoEvent(dedup_key=f"dm_echo:{mid}", recipient_id=recipient_id)
         return None
 
     mid = message.get("mid")

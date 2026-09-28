@@ -112,6 +112,73 @@ def post_spam_check(app: App, *, channel_id: str, db_path: str, message: Message
         conn.close()
 
 
+def post_expiry_nudge(
+    app: App,
+    *,
+    channel_id: str,
+    db_path: str,
+    message: Message,
+    draft_id: int,
+    expires_at_display: str,
+    message_translation: Optional[str] = None,
+    draft_translation: Optional[str] = None,
+) -> str:
+    """Posts a fresh approval card for a DM draft nearing Meta's 24h reply
+    window, reusing the same Approve/Edit/Reject buttons (identical
+    action_ids and value payload) as the original -- the existing handlers
+    key off message_id/draft_id, not which Slack message posted them, so
+    clicking them here works exactly the same way. Updates
+    drafts.slack_message_ts to this new ts so any later resolution update
+    (Approve/Reject/echo-cancel) targets the freshest message rather than
+    the stale original."""
+    conn = get_connection(db_path)
+    try:
+        draft = get_draft(conn, draft_id)
+        if draft is None:
+            raise ValueError(f"No draft row with id={draft_id}")
+
+        blocks = _build_pending_blocks(message, draft, message_translation, draft_translation)
+        blocks.insert(
+            1,
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": (
+                            f"⏰ *Expiring soon* — Meta's 24h reply window closes at "
+                            f"{expires_at_display}. Please approve, edit, or reject before then."
+                        ),
+                    }
+                ],
+            },
+        )
+
+        result = app.client.chat_postMessage(
+            channel=channel_id,
+            blocks=blocks,
+            text=f"⏰ DM draft expiring soon: {message.text[:50]}",
+        )
+        ts = result["ts"]
+        update_draft_slack_ts(conn, draft_id, ts)
+        return ts
+    finally:
+        conn.close()
+
+
+def update_message_as_already_handled(app: App, *, channel_id: str, ts: str, message: Message, reason: str) -> None:
+    """Overwrites a pending Slack card to show it was cancelled -- used by
+    echo detection when a teammate (or our own bot) already replied via
+    Meta Business Suite / the Graph API before Slack approval happened.
+
+    Builds fresh blocks rather than trying to preserve the original card's
+    content: chat.update doesn't hand back the old blocks, and the bot
+    doesn't have the channels:history scope needed to fetch them.
+    """
+    blocks = _build_already_handled_blocks(message, reason)
+    app.client.chat_update(channel=channel_id, ts=ts, blocks=blocks, text=reason)
+
+
 def post_alert_only(
     app: App,
     *,
@@ -326,6 +393,24 @@ def _build_alert_only_blocks(message: Message, message_translation: Optional[str
     return blocks
 
 
+def _build_already_handled_blocks(message: Message, reason: str) -> List[dict]:
+    return [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"🔁 Already handled — {_label(message)}", "emoji": True},
+        },
+        {
+            "type": "section",
+            "fields": [{"type": "mrkdwn", "text": f"*From:*\n@{message.sender_username or message.sender_id}"}],
+        },
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*Message:*\n{message.text}"},
+        },
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": reason}]},
+    ]
+
+
 def _replace_actions_with_resolution(blocks: List[dict], resolution_line: str) -> List[dict]:
     kept = [b for b in blocks if b.get("type") != "actions"]
     kept.append({"type": "context", "elements": [{"type": "mrkdwn", "text": resolution_line}]})
@@ -383,11 +468,11 @@ def _register_listeners(app: App, *, db_path: str, send_callbacks: SendCallbacks
     def guard_still_pending(client, body, message_id: str, expected_status: MessageStatus, conn) -> Optional[Message]:
         message = get_message(conn, message_id)
         if message is None or message.status != expected_status:
-            client.chat_postEphemeral(
-                channel=body["channel"]["id"],
-                user=body["user"]["id"],
-                text="Someone already acted on this one — refresh to see the latest state.",
-            )
+            if message is not None and message.status == MessageStatus.ALREADY_HANDLED:
+                text = "This draft was cancelled because the team already replied via Meta Business Suite."
+            else:
+                text = "Someone already acted on this one — refresh to see the latest state."
+            client.chat_postEphemeral(channel=body["channel"]["id"], user=body["user"]["id"], text=text)
             return None
         return message
 
@@ -492,11 +577,11 @@ def _register_listeners(app: App, *, db_path: str, send_callbacks: SendCallbacks
         try:
             message = get_message(conn, message_id)
             if message is None or message.status != MessageStatus.PENDING_APPROVAL:
-                client.chat_postEphemeral(
-                    channel=metadata["channel_id"],
-                    user=body["user"]["id"],
-                    text="Someone already acted on this one before your edit was submitted.",
-                )
+                if message is not None and message.status == MessageStatus.ALREADY_HANDLED:
+                    text = "This draft was cancelled because the team already replied via Meta Business Suite."
+                else:
+                    text = "Someone already acted on this one before your edit was submitted."
+                client.chat_postEphemeral(channel=metadata["channel_id"], user=body["user"]["id"], text=text)
                 return
 
             now = _now_iso()

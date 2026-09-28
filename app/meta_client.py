@@ -107,6 +107,48 @@ class MetaClient:
             params={"fields": "id,message,from,created_time", "limit": limit},
         )
 
+    def get_conversations(self, limit: int = 50) -> Dict[str, Any]:
+        """Lists recent DM conversations for the Page -- used by backfill to
+        find conversations that may have unanswered messages. Combine with
+        get_conversation() to fetch each one's actual messages."""
+        return self._get(
+            f"{self._page_id}/conversations",
+            params={"fields": "id,participants,updated_time", "limit": limit},
+        )
+
+    def get_comment_replies(self, comment_id: str, limit: int = 25) -> Dict[str, Any]:
+        """Lists direct replies to a comment -- the same edge reply_to_comment()
+        posts to. Used as a fallback echo-detection check: if any reply's
+        `from.id` is ours, someone (bot or a teammate via Business Suite)
+        already replied."""
+        return self._get(
+            f"{comment_id}/comments",
+            params={"fields": "id,from,created_time", "limit": limit},
+        )
+
+    def get_recent_posts(self, limit: int = 10) -> Dict[str, Any]:
+        """Lists recent Facebook Page posts -- backfill fetches comments per
+        post since there's no single endpoint for "all recent comments"."""
+        return self._get(f"{self._page_id}/posts", params={"fields": "id,created_time", "limit": limit})
+
+    def get_recent_media(self, limit: int = 10) -> Dict[str, Any]:
+        """Lists recent Instagram media -- the IG equivalent of get_recent_posts()."""
+        return self._get(
+            f"{self._ig_business_id}/media", params={"fields": "id,timestamp", "limit": limit}
+        )
+
+    def get_comments_for_post(self, post_id: str, limit: int = 25) -> Dict[str, Any]:
+        return self._get(
+            f"{post_id}/comments",
+            params={"fields": "id,message,from,created_time", "limit": limit},
+        )
+
+    def get_comments_for_media(self, media_id: str, limit: int = 25) -> Dict[str, Any]:
+        return self._get(
+            f"{media_id}/comments",
+            params={"fields": "id,text,username,timestamp", "limit": limit},
+        )
+
     # ---- writes ----
 
     def reply_to_comment(self, comment_id: str, message: str) -> Dict[str, Any]:

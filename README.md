@@ -8,12 +8,13 @@ accounts — only Nexoryn's own.
 
 ## Current status
 
-Built in phases. **Phases A–D are complete**: config/DB scaffold, the Meta
-and Claude clients, the Slack approvals app (post/Approve/Edit/Reject,
-Hide/Keep for spam), and the webhook receiver + full pipeline wiring them
-together. What's still missing (Phase E): backfilling the last 24h on
-startup, echo detection (cancel a draft if a human already replied via
-Meta Business Suite), and draft expiry/nudge background jobs.
+Built in phases. **Phases A–E are complete** and feature-complete for local
+testing: config/DB scaffold, the Meta and Claude clients, the Slack
+approvals app (post/Approve/Edit/Reject, Hide/Keep for spam), the webhook
+receiver + full pipeline, startup backfill, echo detection, and draft
+expiry/nudge. 131/131 tests pass, all against mocked Meta/Slack/Anthropic
+responses. What's left before a real deployment: Phase F (Oracle Cloud VM,
+systemd/scheduled startup) — a separate follow-up session.
 
 ## Prerequisites
 
@@ -82,15 +83,15 @@ Meta Business Suite), and draft expiry/nudge background jobs.
 │   ├── claude_client.py     # Claude classify/draft/translate calls
 │   ├── knowledge.py          # loads + cache-prepares the knowledge file, extracts fixed strings
 │   ├── slack_app.py            # Slack Bolt app: post draft/spam-check/alert-only, button + modal handlers
-│   ├── webhooks.py               # Meta webhook receiver: verify challenge, signature check, payload parsing, dedup
+│   ├── webhooks.py               # Meta webhook receiver: verify challenge, signature check, payload parsing, dedup, echo dispatch
 │   ├── pipeline.py                 # core event -> classify -> draft/handoff/spam routing -> Slack
-│   ├── dedupe.py                     # webhook-event dedup (echo detection + expiry jobs: Phase E)
-│   └── main.py                        # FastAPI app entrypoint; starts Slack Socket Mode alongside it
+│   ├── dedupe.py                     # webhook-event dedup, echo detection, draft expiry/nudge
+│   └── main.py                        # FastAPI entrypoint; startup backfill, Slack Socket Mode, APScheduler jobs
 ├── scripts/
 │   ├── verify_setup.py         # run this first
 │   ├── try_pipeline_sample.py    # classify+draft a few sample messages via the real API, no Slack/webhooks
 │   ├── try_slack_draft.py          # posts fake drafts and runs Slack Socket Mode so you can click buttons live
-│   └── backfill.py                   # pulls last 24h of unanswered messages (Phase E)
+│   └── backfill.py                   # pulls unanswered comments/DMs from the last N hours; also runnable standalone
 └── tests/
 ```
 
@@ -104,6 +105,29 @@ This starts the FastAPI webhook server on port 8000 **and** connects the
 Slack app in Socket Mode in the background, so both webhook delivery and
 Slack button clicks work from one process. Visit `http://localhost:8000/health`
 to confirm it's up.
+
+On startup, before Slack connects, it runs a one-time backfill (last 24h of
+unanswered comments/DMs) and then schedules two background jobs every 10
+minutes: a fallback comment-echo poll (see below) and the draft
+expiry/nudge check for DMs approaching Meta's 24h reply window.
+
+To run just the backfill without starting the server:
+
+```bash
+python scripts/backfill.py               # last 24h, up to 100 messages
+python scripts/backfill.py --hours 48 --limit 50
+```
+
+### Echo detection
+
+If a teammate replies to a comment or DM via Meta Business Suite before a
+Slack draft is approved, the pending draft is cancelled automatically (its
+Slack card updates to "🔁 Already handled", buttons removed) rather than
+risking a duplicate or contradictory reply. This is mostly event-driven —
+DMs use the messaging webhook's `is_echo` field, comments use the new-
+comment webhook's `parent` field — so it costs no extra Graph API calls in
+the common case. The 10-minute comment-echo poll only exists as a fallback
+safety net, in case a reply's webhook event ever lacks a usable parent id.
 
 ## Testing webhooks locally with cloudflared
 

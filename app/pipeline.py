@@ -69,6 +69,30 @@ class MessageEvent:
     text: str
 
 
+@dataclass(frozen=True)
+class DmEchoEvent:
+    """The Page just messaged this customer (is_echo webhook event) --
+    could be our own just-approved send, or a teammate replying via Meta
+    Business Suite. dedupe.handle_dm_echo() figures out which."""
+
+    dedup_key: str
+    recipient_id: str
+
+
+@dataclass(frozen=True)
+class CommentEchoEvent:
+    """A new comment authored by our own account, in reply to
+    `parent_comment_id` -- same ambiguity as DmEchoEvent."""
+
+    dedup_key: str
+    parent_comment_id: str
+
+
+# Meta's 24-hour window to reply to a DM (from when the customer's message
+# was received), used to set drafts.draft_expires_at for the expiry/nudge job.
+DM_REPLY_WINDOW = dt.timedelta(hours=24)
+
+
 def _now_iso() -> str:
     return dt.datetime.now().isoformat(timespec="seconds")
 
@@ -84,7 +108,7 @@ def process_comment_event(ctx: PipelineContext, event: CommentEvent) -> None:
         received_at=_now_iso(),
         status=MessageStatus.PENDING_DRAFT,
     )
-    _process_message(ctx, message)
+    process_message(ctx, message)
 
 
 def process_message_event(ctx: PipelineContext, event: MessageEvent) -> None:
@@ -98,7 +122,7 @@ def process_message_event(ctx: PipelineContext, event: MessageEvent) -> None:
         received_at=_now_iso(),
         status=MessageStatus.PENDING_DRAFT,
     )
-    _process_message(ctx, message)
+    process_message(ctx, message)
 
 
 def _fetch_conversation_history(ctx: PipelineContext, message: Message) -> Optional[List[ConversationTurn]]:
@@ -112,7 +136,7 @@ def _fetch_conversation_history(ctx: PipelineContext, message: Message) -> Optio
     return None
 
 
-def _process_message(ctx: PipelineContext, message: Message) -> None:
+def process_message(ctx: PipelineContext, message: Message) -> None:
     conn = get_connection(ctx.db_path)
     try:
         if get_message(conn, message.id) is not None:
@@ -188,12 +212,18 @@ def _process_message(ctx: PipelineContext, message: Message) -> None:
             except Exception:  # noqa: BLE001
                 logger.exception("draft_translation_failed", extra={"message_id": message.id})
 
+        draft_expires_at = None
+        if message.type == MessageType.DM:
+            received = dt.datetime.fromisoformat(message.received_at)
+            draft_expires_at = (received + DM_REPLY_WINDOW).isoformat(timespec="seconds")
+
         draft = Draft(
             message_id=message.id,
             draft_text=draft_text,
             created_at=_now_iso(),
             draft_language=result.language.value,
             is_handoff=draft_result.is_handoff,
+            draft_expires_at=draft_expires_at,
         )
         draft_id = insert_draft(conn, draft)
         update_message_status(conn, message.id, MessageStatus.PENDING_APPROVAL)

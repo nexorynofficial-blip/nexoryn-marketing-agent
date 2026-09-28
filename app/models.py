@@ -77,6 +77,8 @@ class Draft:
     approved_at: Optional[str] = None
     sent_at: Optional[str] = None
     edited_text: Optional[str] = None
+    draft_expires_at: Optional[str] = None
+    nudged_at: Optional[str] = None
 
 
 @dataclass

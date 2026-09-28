@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from app.config import Config
 from app.db import init_db
 from app.models import Platform
-from app.pipeline import CommentEvent, MessageEvent, PipelineContext
+from app.pipeline import CommentEchoEvent, CommentEvent, DmEchoEvent, MessageEvent, PipelineContext
 from app.webhooks import _iter_events, _parse_change, _parse_messaging_event, build_webhook_router
 
 OWN_IDS = {"PAGE123", "IG456"}
@@ -55,12 +55,45 @@ class TestParseChange:
         change = {"field": "ratings", "value": {}}
         assert _parse_change(change, Platform.FACEBOOK, OWN_IDS) is None
 
-    def test_own_comment_skipped(self):
+    def test_own_comment_without_parent_skipped_entirely(self):
         change = {
             "field": "comments",
             "value": {"id": "c4", "text": "our own reply", "from": {"id": "IG456"}},
         }
         assert _parse_change(change, Platform.INSTAGRAM, OWN_IDS) is None
+
+    def test_own_comment_with_parent_becomes_comment_echo_event(self):
+        change = {
+            "field": "comments",
+            "value": {
+                "id": "reply1",
+                "text": "our own reply",
+                "from": {"id": "IG456"},
+                "parent": {"id": "original_comment_1"},
+            },
+        }
+        event = _parse_change(change, Platform.INSTAGRAM, OWN_IDS)
+
+        assert isinstance(event, CommentEchoEvent)
+        assert event.parent_comment_id == "original_comment_1"
+        assert event.dedup_key == "comment_echo:reply1"
+
+    def test_own_facebook_feed_reply_with_parent_id_becomes_echo_event(self):
+        change = {
+            "field": "feed",
+            "value": {
+                "item": "comment",
+                "verb": "add",
+                "comment_id": "reply2",
+                "message": "our own reply",
+                "from": {"id": "PAGE123"},
+                "parent_id": "original_comment_2",
+            },
+        }
+        event = _parse_change(change, Platform.FACEBOOK, OWN_IDS)
+
+        assert isinstance(event, CommentEchoEvent)
+        assert event.parent_comment_id == "original_comment_2"
 
     def test_missing_sender_id_ignored(self):
         change = {"field": "comments", "value": {"id": "c5", "text": "hi", "from": {}}}
@@ -77,9 +110,21 @@ class TestParseMessagingEvent:
         assert parsed.sender_id == "u1"
         assert parsed.dedup_key == "message:m1"
 
-    def test_echo_skipped(self):
+    def test_echo_without_recipient_is_skipped_entirely(self):
         event = {"sender": {"id": "PAGE123"}, "message": {"mid": "m2", "text": "our sent reply", "is_echo": True}}
         assert _parse_messaging_event(event, Platform.FACEBOOK, OWN_IDS) is None
+
+    def test_echo_with_recipient_becomes_dm_echo_event(self):
+        event = {
+            "sender": {"id": "PAGE123"},
+            "recipient": {"id": "customer_1"},
+            "message": {"mid": "m2", "text": "our sent reply", "is_echo": True},
+        }
+        parsed = _parse_messaging_event(event, Platform.FACEBOOK, OWN_IDS)
+
+        assert isinstance(parsed, DmEchoEvent)
+        assert parsed.recipient_id == "customer_1"
+        assert parsed.dedup_key == "dm_echo:m2"
 
     def test_own_sender_without_echo_flag_still_skipped(self):
         event = {"sender": {"id": "IG456"}, "message": {"mid": "m3", "text": "x"}}
@@ -258,3 +303,51 @@ class TestWebhookRouter:
         r = client.post("/webhook", content=body, headers={"X-Hub-Signature-256": sign(body, config.meta_app_secret)})
 
         assert r.status_code == 200
+
+    def test_dm_echo_event_dispatches_to_handle_dm_echo(self, tmp_path, monkeypatch):
+        client, config = make_client(tmp_path)
+        calls = []
+        monkeypatch.setattr("app.webhooks.handle_dm_echo", lambda ctx, recipient_id: calls.append(recipient_id))
+
+        payload = {
+            "object": "instagram",
+            "entry": [{
+                "id": "IG456",
+                "messaging": [{
+                    "sender": {"id": "PAGE123"},
+                    "recipient": {"id": "customer_1"},
+                    "message": {"mid": "m1", "text": "reply", "is_echo": True},
+                }],
+            }],
+        }
+        body = json.dumps(payload).encode()
+        r = client.post("/webhook", content=body, headers={"X-Hub-Signature-256": sign(body, config.meta_app_secret)})
+
+        assert r.status_code == 200
+        assert calls == ["customer_1"]
+
+    def test_comment_echo_event_dispatches_to_handle_comment_echo(self, tmp_path, monkeypatch):
+        client, config = make_client(tmp_path)
+        calls = []
+        monkeypatch.setattr("app.webhooks.handle_comment_echo", lambda ctx, parent_comment_id: calls.append(parent_comment_id))
+
+        payload = {
+            "object": "instagram",
+            "entry": [{
+                "id": "IG456",
+                "changes": [{
+                    "field": "comments",
+                    "value": {
+                        "id": "reply1",
+                        "text": "our reply",
+                        "from": {"id": "IG456"},
+                        "parent": {"id": "original_comment_1"},
+                    },
+                }],
+            }],
+        }
+        body = json.dumps(payload).encode()
+        r = client.post("/webhook", content=body, headers={"X-Hub-Signature-256": sign(body, config.meta_app_secret)})
+
+        assert r.status_code == 200
+        assert calls == ["original_comment_1"]
