@@ -1,261 +1,211 @@
-from pathlib import Path
-
 from app.db import (
+    get_comments_for_post,
     get_connection,
-    get_draft,
-    get_draft_for_message,
-    get_message,
-    get_pending_dm_message_by_sender,
+    get_last_summary,
+    get_post,
+    get_posts_since,
+    get_recent_summaries,
+    get_unanswered_comments,
     init_db,
-    insert_draft,
-    insert_message,
-    list_expiring_unnudged_dm_drafts,
-    list_pending_comment_message_ids,
-    update_draft_approval,
-    update_draft_edited_text,
-    update_draft_nudged,
-    update_draft_sent,
-    update_draft_slack_ts,
-    update_message_status,
+    store_comments,
+    store_messages,
+    store_posts,
+    store_summary,
+    update_comment_sentiment,
+    update_message_theme,
 )
-from app.models import Classification, Draft, Language, Message, MessageStatus, MessageType, Platform
+from app.models import Comment, Message, Post, Summary
 
 
-def make_db(tmp_path: Path) -> str:
+def make_db(tmp_path) -> str:
     db_path = str(tmp_path / "test.db")
     init_db(db_path)
     return db_path
 
 
+def make_post(**overrides) -> Post:
+    defaults = dict(
+        id="post-1",
+        message="Check out our new product!",
+        created_time="2026-10-01T10:00:00",
+        reactions_count=10,
+        comments_count=2,
+        engagement_score=12,
+        fetched_at="2026-10-01T12:00:00",
+    )
+    defaults.update(overrides)
+    return Post(**defaults)
+
+
+def make_comment(**overrides) -> Comment:
+    defaults = dict(
+        id="comment-1",
+        post_id="post-1",
+        text="Is this available in Europe?",
+        author_name="Sarah M.",
+        created_time="2026-10-01T10:15:00",
+        has_page_reply=False,
+        fetched_at="2026-10-01T12:00:00",
+    )
+    defaults.update(overrides)
+    return Comment(**defaults)
+
+
 def make_message(**overrides) -> Message:
     defaults = dict(
         id="msg-1",
-        platform=Platform.INSTAGRAM,
-        type=MessageType.COMMENT,
+        conversation_id="conv-1",
         sender_id="user-1",
-        sender_username="jane_doe",
-        text="Do you build websites?",
-        received_at="2026-09-26T10:00:00",
-        detected_language=Language.ENGLISH,
-        classification=Classification.QUESTION,
-        status=MessageStatus.PENDING_APPROVAL,
+        text="When will my order ship?",
+        created_time="2026-10-01T11:00:00",
+        is_from_page=False,
+        fetched_at="2026-10-01T12:00:00",
     )
     defaults.update(overrides)
     return Message(**defaults)
 
 
-def test_insert_and_get_message_round_trips_enums(tmp_path):
-    db_path = make_db(tmp_path)
-    conn = get_connection(db_path)
-    try:
-        insert_message(conn, make_message())
-        loaded = get_message(conn, "msg-1")
+class TestPosts:
+    def test_store_and_get_post(self, tmp_path):
+        conn = get_connection(make_db(tmp_path))
+        try:
+            store_posts(conn, [make_post()], now="2026-10-01T12:00:00")
+            loaded = get_post(conn, "post-1")
+            assert loaded.message == "Check out our new product!"
+            assert loaded.engagement_score == 12
+        finally:
+            conn.close()
 
-        assert loaded.id == "msg-1"
-        assert loaded.platform == Platform.INSTAGRAM
-        assert loaded.type == MessageType.COMMENT
-        assert loaded.detected_language == Language.ENGLISH
-        assert loaded.classification == Classification.QUESTION
-        assert loaded.status == MessageStatus.PENDING_APPROVAL
-    finally:
-        conn.close()
+    def test_upsert_preserves_created_at_but_updates_fields(self, tmp_path):
+        conn = get_connection(make_db(tmp_path))
+        try:
+            store_posts(conn, [make_post()], now="2026-10-01T12:00:00")
+            created_at_before = conn.execute("SELECT created_at FROM posts WHERE id = 'post-1'").fetchone()[0]
 
+            store_posts(conn, [make_post(reactions_count=50, engagement_score=52)], now="2026-10-01T14:00:00")
 
-def test_get_message_missing_returns_none(tmp_path):
-    db_path = make_db(tmp_path)
-    conn = get_connection(db_path)
-    try:
-        assert get_message(conn, "does-not-exist") is None
-    finally:
-        conn.close()
+            row = conn.execute("SELECT created_at, updated_at, reactions_count FROM posts WHERE id = 'post-1'").fetchone()
+            assert row["created_at"] == created_at_before  # unchanged
+            assert row["updated_at"] == "2026-10-01T14:00:00"  # bumped
+            assert row["reactions_count"] == 50
+        finally:
+            conn.close()
 
-
-def test_update_message_status(tmp_path):
-    db_path = make_db(tmp_path)
-    conn = get_connection(db_path)
-    try:
-        insert_message(conn, make_message())
-        update_message_status(conn, "msg-1", MessageStatus.SENT)
-        loaded = get_message(conn, "msg-1")
-        assert loaded.status == MessageStatus.SENT
-    finally:
-        conn.close()
-
-
-def test_insert_and_get_draft_round_trip(tmp_path):
-    db_path = make_db(tmp_path)
-    conn = get_connection(db_path)
-    try:
-        insert_message(conn, make_message())
-        draft = Draft(
-            message_id="msg-1",
-            draft_text="Yes, we build custom websites!",
-            created_at="2026-09-26T10:01:00",
-            draft_language="en",
-            is_handoff=False,
-        )
-        draft_id = insert_draft(conn, draft)
-        loaded = get_draft(conn, draft_id)
-
-        assert loaded.message_id == "msg-1"
-        assert loaded.draft_text == "Yes, we build custom websites!"
-        assert loaded.is_handoff is False
-        assert loaded.edited_text is None
-    finally:
-        conn.close()
+    def test_get_posts_since_filters_by_cutoff(self, tmp_path):
+        conn = get_connection(make_db(tmp_path))
+        try:
+            store_posts(
+                conn,
+                [
+                    make_post(id="old", created_time="2026-09-29T00:00:00"),
+                    make_post(id="recent", created_time="2026-10-01T11:00:00"),
+                ],
+                now="2026-10-01T12:00:00",
+            )
+            results = get_posts_since(conn, cutoff_iso="2026-10-01T00:00:00")
+            assert [p.id for p in results] == ["recent"]
+        finally:
+            conn.close()
 
 
-def test_draft_approval_sent_and_edited_text_updates(tmp_path):
-    db_path = make_db(tmp_path)
-    conn = get_connection(db_path)
-    try:
-        insert_message(conn, make_message())
-        draft_id = insert_draft(
-            conn,
-            Draft(message_id="msg-1", draft_text="Original AI draft", created_at="2026-09-26T10:01:00"),
-        )
+class TestComments:
+    def test_store_and_get_comments_for_post(self, tmp_path):
+        conn = get_connection(make_db(tmp_path))
+        try:
+            store_posts(conn, [make_post()], now="2026-10-01T12:00:00")
+            store_comments(conn, [make_comment()], now="2026-10-01T12:00:00")
+            results = get_comments_for_post(conn, "post-1")
+            assert len(results) == 1
+            assert results[0].author_name == "Sarah M."
+            assert results[0].has_page_reply is False
+        finally:
+            conn.close()
 
-        update_draft_slack_ts(conn, draft_id, "1234.5678")
-        update_draft_approval(conn, draft_id, approved_by="U123", approved_at="2026-09-26T10:05:00")
-        update_draft_sent(conn, draft_id, sent_at="2026-09-26T10:05:01")
-        update_draft_edited_text(conn, draft_id, "Human-edited final reply")
+    def test_get_unanswered_comments_excludes_answered(self, tmp_path):
+        conn = get_connection(make_db(tmp_path))
+        try:
+            store_posts(conn, [make_post()], now="2026-10-01T12:00:00")
+            store_comments(
+                conn,
+                [
+                    make_comment(id="c1", has_page_reply=False, created_time="2026-10-01T10:00:00"),
+                    make_comment(id="c2", has_page_reply=True, created_time="2026-10-01T10:05:00"),
+                ],
+                now="2026-10-01T12:00:00",
+            )
+            results = get_unanswered_comments(conn, cutoff_iso="2026-10-01T00:00:00")
+            assert [c.id for c in results] == ["c1"]
+        finally:
+            conn.close()
 
-        loaded = get_draft(conn, draft_id)
-        assert loaded.slack_message_ts == "1234.5678"
-        assert loaded.approved_by == "U123"
-        assert loaded.approved_at == "2026-09-26T10:05:00"
-        assert loaded.sent_at == "2026-09-26T10:05:01"
-        assert loaded.edited_text == "Human-edited final reply"
-        # draft_text (the original AI draft) must stay untouched -- both
-        # versions need to remain recoverable from the DB.
-        assert loaded.draft_text == "Original AI draft"
-    finally:
-        conn.close()
+    def test_sentiment_preserved_on_upsert_unless_explicitly_set(self, tmp_path):
+        conn = get_connection(make_db(tmp_path))
+        try:
+            store_posts(conn, [make_post()], now="2026-10-01T12:00:00")
+            store_comments(conn, [make_comment()], now="2026-10-01T12:00:00")
+            update_comment_sentiment(conn, "comment-1", "positive")
 
+            # Re-fetching the same comment (sentiment=None on the fresh object)
+            # must not wipe out the sentiment we already computed.
+            store_comments(conn, [make_comment(has_page_reply=True)], now="2026-10-01T14:00:00")
 
-def test_get_pending_dm_message_by_sender_finds_most_recent(tmp_path):
-    db_path = make_db(tmp_path)
-    conn = get_connection(db_path)
-    try:
-        insert_message(conn, make_message(
-            id="dm-1", type=MessageType.DM, sender_id="cust-1",
-            received_at="2026-09-26T09:00:00", status=MessageStatus.PENDING_APPROVAL,
-        ))
-        insert_message(conn, make_message(
-            id="dm-2", type=MessageType.DM, sender_id="cust-1",
-            received_at="2026-09-26T10:00:00", status=MessageStatus.PENDING_APPROVAL,
-        ))
-        # A different sender's pending DM must not be returned.
-        insert_message(conn, make_message(
-            id="dm-3", type=MessageType.DM, sender_id="cust-2",
-            received_at="2026-09-26T11:00:00", status=MessageStatus.PENDING_APPROVAL,
-        ))
-
-        found = get_pending_dm_message_by_sender(conn, "cust-1")
-        assert found.id == "dm-2"  # most recent
-    finally:
-        conn.close()
+            result = get_comments_for_post(conn, "post-1")[0]
+            assert result.sentiment == "positive"
+            assert result.has_page_reply is True
+        finally:
+            conn.close()
 
 
-def test_get_pending_dm_message_by_sender_ignores_non_pending(tmp_path):
-    db_path = make_db(tmp_path)
-    conn = get_connection(db_path)
-    try:
-        insert_message(conn, make_message(
-            id="dm-1", type=MessageType.DM, sender_id="cust-1", status=MessageStatus.SENT,
-        ))
-        assert get_pending_dm_message_by_sender(conn, "cust-1") is None
-    finally:
-        conn.close()
+class TestMessages:
+    def test_store_and_theme_persistence(self, tmp_path):
+        conn = get_connection(make_db(tmp_path))
+        try:
+            store_messages(conn, [make_message()], now="2026-10-01T12:00:00")
+            update_message_theme(conn, "msg-1", "Order status")
+
+            # A re-fetch with theme=None must not clobber the saved theme.
+            store_messages(conn, [make_message(text="updated text")], now="2026-10-01T14:00:00")
+
+            from app.db import get_messages_since
+
+            result = get_messages_since(conn, cutoff_iso="2026-10-01T00:00:00")[0]
+            assert result.theme == "Order status"
+            assert result.text == "updated text"
+        finally:
+            conn.close()
 
 
-def test_get_pending_dm_message_by_sender_ignores_comments(tmp_path):
-    db_path = make_db(tmp_path)
-    conn = get_connection(db_path)
-    try:
-        insert_message(conn, make_message(
-            id="c-1", type=MessageType.COMMENT, sender_id="cust-1", status=MessageStatus.PENDING_APPROVAL,
-        ))
-        assert get_pending_dm_message_by_sender(conn, "cust-1") is None
-    finally:
-        conn.close()
+class TestSummaries:
+    def test_store_and_get_last_summary(self, tmp_path):
+        conn = get_connection(make_db(tmp_path))
+        try:
+            s = Summary(timestamp="2026-10-01T17:45:00", status="healthy", message="all good")
+            store_summary(conn, s, now="2026-10-01T17:45:00")
 
+            loaded = get_last_summary(conn)
+            assert loaded.status == "healthy"
+            assert loaded.message == "all good"
+        finally:
+            conn.close()
 
-def test_get_draft_for_message(tmp_path):
-    db_path = make_db(tmp_path)
-    conn = get_connection(db_path)
-    try:
-        insert_message(conn, make_message())
-        draft_id = insert_draft(
-            conn, Draft(message_id="msg-1", draft_text="Hi", created_at="2026-09-26T10:01:00")
-        )
-        found = get_draft_for_message(conn, "msg-1")
-        assert found.id == draft_id
-        assert get_draft_for_message(conn, "no-such-message") is None
-    finally:
-        conn.close()
+    def test_get_last_summary_none_when_empty(self, tmp_path):
+        conn = get_connection(make_db(tmp_path))
+        try:
+            assert get_last_summary(conn) is None
+        finally:
+            conn.close()
 
-
-def test_list_pending_comment_message_ids(tmp_path):
-    db_path = make_db(tmp_path)
-    conn = get_connection(db_path)
-    try:
-        insert_message(conn, make_message(id="c-1", status=MessageStatus.PENDING_APPROVAL))
-        insert_message(conn, make_message(id="c-2", status=MessageStatus.SENT))
-        insert_message(conn, make_message(
-            id="dm-1", type=MessageType.DM, status=MessageStatus.PENDING_APPROVAL,
-        ))
-
-        ids = list_pending_comment_message_ids(conn)
-        assert ids == ["c-1"]
-    finally:
-        conn.close()
-
-
-def test_list_expiring_unnudged_dm_drafts(tmp_path):
-    db_path = make_db(tmp_path)
-    conn = get_connection(db_path)
-    try:
-        insert_message(conn, make_message(id="dm-1", type=MessageType.DM, status=MessageStatus.PENDING_APPROVAL))
-        insert_message(conn, make_message(id="dm-2", type=MessageType.DM, status=MessageStatus.PENDING_APPROVAL))
-        insert_message(conn, make_message(id="dm-3", type=MessageType.DM, status=MessageStatus.PENDING_APPROVAL))
-
-        # Expiring soon, not yet nudged -- should be included.
-        insert_draft(conn, Draft(
-            message_id="dm-1", draft_text="x", created_at="2026-09-26T10:00:00",
-            draft_expires_at="2026-09-26T12:00:00",
-        ))
-        # Expiring soon, but already nudged -- should be excluded.
-        insert_draft(conn, Draft(
-            message_id="dm-2", draft_text="x", created_at="2026-09-26T10:00:00",
-            draft_expires_at="2026-09-26T12:00:00", nudged_at="2026-09-26T11:00:00",
-        ))
-        # Not expiring soon -- should be excluded.
-        insert_draft(conn, Draft(
-            message_id="dm-3", draft_text="x", created_at="2026-09-26T10:00:00",
-            draft_expires_at="2026-09-27T12:00:00",
-        ))
-
-        results = list_expiring_unnudged_dm_drafts(conn, cutoff_iso="2026-09-26T14:00:00")
-
-        assert len(results) == 1
-        message, draft = results[0]
-        assert message.id == "dm-1"
-        assert draft.draft_expires_at == "2026-09-26T12:00:00"
-    finally:
-        conn.close()
-
-
-def test_update_draft_nudged(tmp_path):
-    db_path = make_db(tmp_path)
-    conn = get_connection(db_path)
-    try:
-        insert_message(conn, make_message())
-        draft_id = insert_draft(conn, Draft(message_id="msg-1", draft_text="x", created_at="2026-09-26T10:00:00"))
-
-        update_draft_nudged(conn, draft_id, "2026-09-26T11:00:00")
-
-        loaded = get_draft(conn, draft_id)
-        assert loaded.nudged_at == "2026-09-26T11:00:00"
-    finally:
-        conn.close()
+    def test_get_recent_summaries_newest_first_and_limited(self, tmp_path):
+        conn = get_connection(make_db(tmp_path))
+        try:
+            for i in range(7):
+                store_summary(
+                    conn,
+                    Summary(timestamp=f"2026-10-01T1{i}:00:00", status="healthy", message="ok"),
+                    now=f"2026-10-01T1{i}:00:00",
+                )
+            recent = get_recent_summaries(conn, limit=5)
+            assert len(recent) == 5
+            assert recent[0].timestamp == "2026-10-01T16:00:00"  # most recent first
+        finally:
+            conn.close()

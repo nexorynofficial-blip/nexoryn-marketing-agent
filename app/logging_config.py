@@ -1,16 +1,15 @@
-"""Structured JSON logging setup, shared by main.py and any script that
-wants the same format (verify_setup.py, backfill.py, etc. can opt in too).
+"""Structured JSON logging setup, shared by cli.py and any script that
+wants the same format.
 
 Wires structlog into Python's standard logging so every existing
 `logging.getLogger(__name__).info(...)` / `.exception(..., extra={...})`
 call across the codebase renders as a JSON line -- no call-site changes
-needed anywhere in meta_client.py, claude_client.py, slack_app.py,
-webhooks.py, pipeline.py, dedupe.py, or scripts/backfill.py.
+needed anywhere in meta_client.py, claude_client.py, db.py, or
+summary_generator.py.
 
-stdout is always a sink (systemd captures it via journald with no extra
-config). A second sink at `log_file_path` is added only when one is
-configured (production, via LOG_FILE_PATH in .env) -- local dev leaves
-this unset and just gets stdout.
+stdout is always a sink. A second sink at `log_file_path` is added only
+when one is configured (via LOG_FILE_PATH in .env) -- by default this is
+unset and logs just go to stdout plus `app.log` (see cli.py).
 """
 from __future__ import annotations
 

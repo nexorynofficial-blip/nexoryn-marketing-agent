@@ -7,3 +7,6 @@ venv/
 .pytest_cache/
 .mypy_cache/
 *.egg-info/
+.cache/
+*.log
+last_summary.json

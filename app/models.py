@@ -1,87 +1,102 @@
-"""Data classes mirroring the SQLite schema defined in db.py."""
+"""Data classes for the Nexoryn Agent CLI.
+
+Post/Comment/Message mirror the SQLite schema in db.py (plain dataclasses,
+matching db.py's existing row<->dataclass mapping style). Summary and its
+nested pieces are pydantic models instead, since they're the CLI's JSON
+output contract -- pydantic gives validation and `.model_dump_json()` for
+free, which matters for "JSON output is ALWAYS valid and structured
+exactly as shown."
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
-from typing import Optional
+from typing import Dict, List, Optional
+
+from pydantic import BaseModel, Field
 
 
-class Platform(str, Enum):
-    INSTAGRAM = "instagram"
-    FACEBOOK = "facebook"
+# ---- raw Facebook data (DB row shapes) ----
 
 
-class MessageType(str, Enum):
-    COMMENT = "comment"
-    DM = "dm"
+@dataclass
+class Post:
+    id: str
+    message: str
+    created_time: str
+    reactions_count: int = 0
+    comments_count: int = 0
+    permalink_url: Optional[str] = None
+    engagement_score: Optional[int] = None
+    fetched_at: Optional[str] = None
 
 
-class Language(str, Enum):
-    ENGLISH = "en"
-    URDU_SCRIPT = "ur_script"
-    URDU_ROMAN = "ur_roman"
-    OTHER = "other"
-
-
-class Classification(str, Enum):
-    LEAD = "lead"
-    QUESTION = "question"
-    COMPLIMENT = "compliment"
-    COMPLAINT = "complaint"
-    SPAM = "spam"
-    OTHER = "other"
-
-
-class MessageStatus(str, Enum):
-    PENDING_DRAFT = "pending_draft"
-    PENDING_APPROVAL = "pending_approval"
-    APPROVED = "approved"
-    SENT = "sent"
-    REJECTED = "rejected"
-    EXPIRED = "expired"
-    ALREADY_HANDLED = "already_handled"
-    SPAM_PENDING = "spam_pending"
-    SPAM_HIDDEN = "spam_hidden"
-    SPAM_KEPT = "spam_kept"
-    # Comment escalated to the team per agency_knowledge.md's "Comments"
-    # section: no public reply is drafted at all, only a Slack alert --
-    # unlike PENDING_APPROVAL there is no draft to approve/reject here.
-    ALERTED = "alerted"
+@dataclass
+class Comment:
+    id: str
+    post_id: str
+    text: str
+    author_name: str
+    created_time: str
+    author_id: Optional[str] = None
+    # True once a reply authored by the Page exists under this (top-level)
+    # comment -- this is what "unanswered" means in summary_generator.py.
+    has_page_reply: bool = False
+    sentiment: Optional[str] = None
+    fetched_at: Optional[str] = None
 
 
 @dataclass
 class Message:
     id: str
-    platform: Platform
-    type: MessageType
+    conversation_id: str
     sender_id: str
     text: str
-    received_at: str
-    sender_username: Optional[str] = None
-    detected_language: Optional[Language] = None
-    english_translation: Optional[str] = None
-    classification: Optional[Classification] = None
-    status: MessageStatus = MessageStatus.PENDING_DRAFT
+    created_time: str
+    sender_name: Optional[str] = None
+    is_from_page: bool = False
+    theme: Optional[str] = None
+    fetched_at: Optional[str] = None
 
 
-@dataclass
-class Draft:
-    message_id: str
-    draft_text: str
-    created_at: str
-    id: Optional[int] = None
-    draft_language: Optional[str] = None
-    is_handoff: bool = False
-    slack_message_ts: Optional[str] = None
-    approved_by: Optional[str] = None
-    approved_at: Optional[str] = None
-    sent_at: Optional[str] = None
-    edited_text: Optional[str] = None
-    draft_expires_at: Optional[str] = None
-    nudged_at: Optional[str] = None
+# ---- output shapes (the CLI's JSON contract) ----
 
 
-@dataclass
-class ProcessedWebhookId:
-    webhook_event_id: str
-    received_at: str
+class UnansweredComment(BaseModel):
+    post_id: str
+    post_title: str
+    comment_text: str
+    author: str
+    time_since: str
+
+
+class LowEngagementPost(BaseModel):
+    post_id: str
+    title: str
+    engagement_score: int
+    reactions: int
+    comments: int
+    posted_ago: str
+
+
+class DMTheme(BaseModel):
+    """Internal working model used while counting/grouping message themes,
+    before flattening into the `dm_themes` dict in Summary's output."""
+
+    name: str
+    count: int
+    percentage: int
+
+
+class Recommendation(BaseModel):
+    text: str
+
+
+class Summary(BaseModel):
+    timestamp: str
+    status: str  # "healthy" | "action_needed"
+    message: str
+    unanswered_comments: List[UnansweredComment] = Field(default_factory=list)
+    low_engagement_posts: List[LowEngagementPost] = Field(default_factory=list)
+    dm_themes: Dict[str, int] = Field(default_factory=dict)
+    recommendations: List[str] = Field(default_factory=list)
+    total_action_items: int = 0
