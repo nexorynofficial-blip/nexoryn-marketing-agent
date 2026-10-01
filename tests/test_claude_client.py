@@ -55,6 +55,25 @@ class TestGenerateRecommendations:
             "Respond to 3 comments",
         ]
 
+    def test_prompt_restricts_to_promotion_tactics_only(self):
+        """Content strategy is decided separately -- this tool must only
+        ever ask Claude for engagement/promotion tactics, never
+        content-creation suggestions (new posts, replies, follow-ups)."""
+        client = make_client_with_mocked_response("1. Boost with paid ads")
+        client.generate_recommendations("some context")
+
+        call_kwargs = client._client.messages.create.call_args.kwargs
+        instructions = call_kwargs["system"]
+        assert "DO recommend: Stories reposts, DM outreach, paid ads, polls, cross-posting" in instructions
+        assert "DON'T recommend: creating new content, writing replies, creating follow-up posts" in instructions
+
+    def test_context_is_included_in_prompt(self):
+        client = make_client_with_mocked_response("1. Boost with paid ads")
+        client.generate_recommendations("Unanswered Comments (2):\n- some comment")
+
+        call_kwargs = client._client.messages.create.call_args.kwargs
+        assert "Unanswered Comments (2):\n- some comment" in call_kwargs["system"]
+
     def test_api_failure_returns_empty_list(self):
         client = ClaudeClient(api_key="test-key")
         client._client = MagicMock()

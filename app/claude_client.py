@@ -61,12 +61,18 @@ class ClaudeClient:
     def generate_recommendations(self, context: str) -> List[str]:
         """Takes a pre-formatted block describing unanswered comments,
         low-engagement posts, and DM themes, and returns a short list of
-        specific, actionable recommendations. Returns [] (not a crash) if
-        the API call itself fails -- callers already only call this when
+        specific, actionable *promotion/engagement* recommendations --
+        never content-creation work (that's a decided, separate strategy,
+        not something this tool suggests). Returns [] (not a crash) if the
+        API call itself fails -- callers already only call this when
         there's real data to work with."""
         instructions = (
             "Based on this Facebook Page data, provide 3-5 SPECIFIC, ACTIONABLE "
-            "steps to increase engagement TODAY. Be concise. Include time estimates.\n\n"
+            "tactics to INCREASE ENGAGEMENT for existing posts TODAY. Be concise. "
+            "Include time estimates.\n\n"
+            "IMPORTANT: Focus ONLY on engagement/promotion tactics:\n"
+            "- DO recommend: Stories reposts, DM outreach, paid ads, polls, cross-posting\n"
+            "- DON'T recommend: creating new content, writing replies, creating follow-up posts\n\n"
             f"{context}\n\n"
             "Return ONLY the numbered list of actions. No introductions or explanations."
         )
